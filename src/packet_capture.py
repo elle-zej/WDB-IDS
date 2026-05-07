@@ -10,7 +10,14 @@ flows = {}
 recent_flows = deque()
 
 FLOW_TIMEOUT = 30          # seconds before an inactive flow is finalized
-RECENT_WINDOW = 60         # seconds for ct_* features
+RECENT_WINDOW = 120        # seconds for ct_* sliding window (2 min captures home network rhythm better than 60s)
+MIN_HISTORY = 20           # warm-up: skip predictions until we have enough flow context
+ATTACK_THRESHOLD = 0.75    # only alert if model is at least 75% confident
+
+# Minimum flow requirements before scoring
+MIN_SPKTS = 2              # at least 2 source packets
+MIN_DPKTS = 1              # must have seen a response
+MIN_SBYTES = 40            # at least one meaningful payload
 
 SERVICE_MAP = {
     20: "ftp-data",
@@ -96,6 +103,23 @@ def tcp_flags_str(packet):
     return str(packet[TCP].flags)
 
 # -----------------------------
+# Completeness check
+# -----------------------------
+def is_flow_scoreable(flow):
+    """
+    Reject flows that are too incomplete to score meaningfully.
+    A one-sided flow with no response looks identical to an attack
+    in the training data — don't score it.
+    """
+    if flow["spkts"] < MIN_SPKTS:
+        return False, f"too few source packets ({flow['spkts']} < {MIN_SPKTS})"
+    if flow["dpkts"] < MIN_DPKTS:
+        return False, f"no response packets (dpkts=0) — one-sided flow"
+    if flow["sbytes"] < MIN_SBYTES:
+        return False, f"source payload too small ({flow['sbytes']} bytes)"
+    return True, "ok"
+
+# -----------------------------
 # State inference
 # -----------------------------
 def infer_state(flow):
@@ -124,7 +148,11 @@ def infer_state(flow):
     return "UNK"
 
 # -----------------------------
-# Recent-flow counting for ct_* features
+# Recent-flow window for ct_* features
+# Time-based window (RECENT_WINDOW seconds) rather than fixed count.
+# This better reflects real-world home network traffic patterns —
+# 100 flows could span 2 minutes or 2 hours depending on activity.
+# A time window captures the right behavioral context regardless.
 # -----------------------------
 def trim_recent_flows(now):
     while recent_flows and now - recent_flows[0]["end_time"] > RECENT_WINDOW:
@@ -133,48 +161,37 @@ def trim_recent_flows(now):
 def count_recent_dst_ltm(dst_ip, now):
     return sum(
         1 for f in recent_flows
-        if now - f["end_time"] <= RECENT_WINDOW
-        and f["dst_ip"] == dst_ip
+        if f["dst_ip"] == dst_ip
     )
 
 def count_recent_dst_src_ltm(src_ip, dst_ip, now):
     return sum(
         1 for f in recent_flows
-        if now - f["end_time"] <= RECENT_WINDOW
-        and f["src_ip"] == src_ip
-        and f["dst_ip"] == dst_ip
+        if f["src_ip"] == src_ip and f["dst_ip"] == dst_ip
     )
 
 def count_recent_srv_src(src_ip, service, now):
     return sum(
         1 for f in recent_flows
-        if now - f["end_time"] <= RECENT_WINDOW
-        and f["src_ip"] == src_ip
-        and f["service"] == service
+        if f["src_ip"] == src_ip and f["service"] == service
     )
 
 def count_recent_srv_dst(dst_ip, service, now):
     return sum(
         1 for f in recent_flows
-        if now - f["end_time"] <= RECENT_WINDOW
-        and f["dst_ip"] == dst_ip
-        and f["service"] == service
+        if f["dst_ip"] == dst_ip and f["service"] == service
     )
 
 def count_recent_dst_sport_ltm(dst_ip, src_port, now):
     return sum(
         1 for f in recent_flows
-        if now - f["end_time"] <= RECENT_WINDOW
-        and f["dst_ip"] == dst_ip
-        and f["src_port"] == src_port
+        if f["dst_ip"] == dst_ip and f["src_port"] == src_port
     )
 
 def count_recent_state_ttl(state, sttl, now):
     return sum(
         1 for f in recent_flows
-        if now - f["end_time"] <= RECENT_WINDOW
-        and f["state"] == state
-        and f["sttl"] == sttl
+        if f["state"] == state and f["sttl"] == sttl
     )
 
 # -----------------------------
@@ -215,12 +232,12 @@ def compute_features(flow):
     now = flow["last_seen"]
     trim_recent_flows(now)
 
-    ct_dst_ltm = count_recent_dst_ltm(flow["origin_dst_ip"], now)
-    ct_dst_src_ltm = count_recent_dst_src_ltm(flow["origin_src_ip"], flow["origin_dst_ip"], now)
-    ct_srv_src = count_recent_srv_src(flow["origin_src_ip"], service, now)
-    ct_srv_dst = count_recent_srv_dst(flow["origin_dst_ip"], service, now)
-    ct_dst_sport_ltm = count_recent_dst_sport_ltm(flow["origin_dst_ip"], flow["origin_src_port"], now)
-    ct_state_ttl = count_recent_state_ttl(state, sttl, now)
+    ct_dst_ltm       = count_recent_dst_ltm(flow["origin_dst_ip"], now)
+    ct_dst_src_ltm   = count_recent_dst_src_ltm(flow["origin_src_ip"], flow["origin_dst_ip"], now)
+    ct_srv_src        = count_recent_srv_src(flow["origin_src_ip"], service, now)
+    ct_srv_dst        = count_recent_srv_dst(flow["origin_dst_ip"], service, now)
+    ct_dst_sport_ltm  = count_recent_dst_sport_ltm(flow["origin_dst_ip"], flow["origin_src_port"], now)
+    ct_state_ttl      = count_recent_state_ttl(state, sttl, now)
 
     return {
         "sttl": sttl,
@@ -249,8 +266,6 @@ def compute_features(flow):
         "proto": flow["proto"],
         "service": service,
         "dur": dur,
-
-        # extra useful diagnostics
         "dinpkt": dinpkt,
         "sjit": sjit,
     }
@@ -260,13 +275,13 @@ def compute_features(flow):
 # -----------------------------
 def add_flow_to_recent_history(flow, features):
     recent_flows.append({
-        "src_ip": flow["origin_src_ip"],
-        "dst_ip": flow["origin_dst_ip"],
+        "src_ip":   flow["origin_src_ip"],
+        "dst_ip":   flow["origin_dst_ip"],
         "src_port": flow["origin_src_port"],
         "dst_port": flow["origin_dst_port"],
-        "service": features["service"],
-        "state": features["state"],
-        "sttl": features["sttl"],
+        "service":  features["service"],
+        "state":    features["state"],
+        "sttl":     features["sttl"],
         "end_time": flow["last_seen"],
     })
 
@@ -275,29 +290,54 @@ def finalize_flow(flow_key):
         return None
 
     flow = flows.pop(flow_key)
+
+    # --- Skip incomplete flows before scoring ---
+    # One-sided or near-empty flows look like attacks to the model
+    # because the training data rarely contained them as normal traffic.
+    scoreable, reason = is_flow_scoreable(flow)
+    if not scoreable:
+        print(f"[SKIPPED] {flow_key} — {reason}")
+        return None
+
     features = compute_features(flow)
+
+    # Always add to history so ct_* counters stay accurate,
+    # even for flows we don't score
     add_flow_to_recent_history(flow, features)
+
+    # --- Warm-up: wait for meaningful history before classifying ---
+    # ct_* features will be near-zero until enough flows have passed.
+    # Classifying during warm-up produces unreliable results.
+    if len(recent_flows) < MIN_HISTORY:
+        print(f"[WARMING UP] {len(recent_flows)}/{MIN_HISTORY} flows in history — skipping prediction")
+        return features
 
     label, probability = predict_flow(features)
 
+    # --- Confidence threshold ---
+    # Home network traffic doesn't match the lab training distribution
+    # perfectly. Requiring higher confidence reduces false positives
+    # without retraining. Flows below threshold are logged, not alerted.
+    if probability >= ATTACK_THRESHOLD:
+        display_label = "⚠️  ATTACK"
+    elif probability >= 0.50:
+        display_label = "⚡ SUSPICIOUS"
+    else:
+        display_label = "✓  Normal"
+
     print("\nFinalized Flow")
-    print(f"Flow Key: {flow_key}")
+    print(f"Flow Key:          {flow_key}")
+    print(f"History size:      {len(recent_flows)} flows in last {RECENT_WINDOW}s")
     for k, v in features.items():
-        print(f"{k}: {v}")
-    print(f"Prediction: {label}")
-    print(f"Attack probability: {probability:.4f}")
+        print(f"  {k}: {v}")
+    print(f"Prediction:        {display_label}  (p={probability:.4f})")
     print("-" * 70)
 
     return features
 
 def cleanup_expired_flows():
     now = time.time()
-    expired = []
-
-    for flow_key, flow in flows.items():
-        if now - flow["last_seen"] > FLOW_TIMEOUT:
-            expired.append(flow_key)
-
+    expired = [k for k, v in flows.items() if now - v["last_seen"] > FLOW_TIMEOUT]
     for flow_key in expired:
         finalize_flow(flow_key)
 
@@ -317,16 +357,16 @@ def handle_packet(packet):
     if flow_key not in flows:
         src_port, dst_port = get_ports(packet)
         flows[flow_key] = {
-            "start_time": now,
-            "last_seen": now,
-            "origin_src_ip": packet[IP].src,
-            "origin_dst_ip": packet[IP].dst,
+            "start_time":      now,
+            "last_seen":       now,
+            "origin_src_ip":   packet[IP].src,
+            "origin_dst_ip":   packet[IP].dst,
             "origin_src_port": src_port,
             "origin_dst_port": dst_port,
-            "proto": get_proto(packet),
+            "proto":           get_proto(packet),
 
-            "spkts": 0,
-            "dpkts": 0,
+            "spkts":  0,
+            "dpkts":  0,
             "sbytes": 0,
             "dbytes": 0,
 
@@ -337,11 +377,11 @@ def handle_packet(packet):
             "dst_times": [],
 
             "tcp_flags_seen": set(),
-            "syn_time": None,
+            "syn_time":    None,
             "synack_time": None,
-            "ack_time": None,
-            "saw_rst": False,
-            "saw_fin": False,
+            "ack_time":    None,
+            "saw_rst":     False,
+            "saw_fin":     False,
         }
 
     flow = flows[flow_key]
@@ -375,18 +415,14 @@ def handle_packet(packet):
             flow["saw_fin"] = True
 
         if forward:
-            # SYN from originator
             if "S" in flags and "A" not in flags and flow["syn_time"] is None:
                 flow["syn_time"] = now
-            # final ACK from originator after SYN-ACK
             if "A" in flags and "S" not in flags and flow["synack_time"] is not None and flow["ack_time"] is None:
                 flow["ack_time"] = now
         else:
-            # SYN-ACK from responder
             if "S" in flags and "A" in flags and flow["synack_time"] is None:
                 flow["synack_time"] = now
 
-        # finalize immediately on RST or FIN if you want faster flow closure
         if flow["saw_rst"] or flow["saw_fin"]:
             finalize_flow(flow_key)
 
@@ -394,11 +430,15 @@ def handle_packet(packet):
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    print("Sniffing packets and building live IDS features...")
+    print("Starting IDS packet capture...")
+    print(f"  Warm-up:    {MIN_HISTORY} flows before predictions begin")
+    print(f"  CT window:  {RECENT_WINDOW}s sliding history")
+    print(f"  Threshold:  {ATTACK_THRESHOLD} confidence to alert")
+    print(f"  Flow timeout: {FLOW_TIMEOUT}s\n")
     try:
         sniff(prn=handle_packet, store=False)
     except KeyboardInterrupt:
-        print("\nStopping sniff. Finalizing remaining flows...")
+        print("\nStopping. Finalizing remaining flows...")
         for key in list(flows.keys()):
             finalize_flow(key)
-        print("Done.") 
+        print("Done.")
