@@ -1,10 +1,12 @@
 import joblib
 import pandas as pd
 
-MODEL_PATH    = "/Users/jezelleoverstreet/WDB_IDS/models/rf_model.pkl"
-ENCODER_PATH  = "/Users/jezelleoverstreet/WDB_IDS/models/ordinal_encoder.pkl"
-FEATURES_PATH = "/Users/jezelleoverstreet/WDB_IDS/models/final_features.pkl"
-SCALER_PATH   = "/Users/jezelleoverstreet/WDB_IDS/models/scaler.pkl"
+# ADD YOUR PATH:
+
+# MODEL_PATH    = "/model/path"
+# ENCODER_PATH  = "/models/encoder"
+# FEATURES_PATH = "/models/features"
+# SCALER_PATH   = "/models/scaler"
 
 model         = joblib.load(MODEL_PATH)
 encoder       = joblib.load(ENCODER_PATH)
@@ -26,6 +28,7 @@ def predict_flow(flow_features: dict):
     # Encode categorical columns using the same encoder fit on training data.
     # handle_unknown='use_encoded_value' means unseen categories (e.g. a
     # service the model never saw) get encoded as -1 rather than crashing.
+
     encoded = encoder.transform(X_live[cat_cols])
     for i, col in enumerate(cat_cols):
         X_live[col] = encoded[:, i]

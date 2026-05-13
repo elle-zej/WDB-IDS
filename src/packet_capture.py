@@ -3,9 +3,7 @@ from collections import deque
 from predict_live import predict_flow
 import time
 
-# -----------------------------
 # Global state
-# -----------------------------
 flows = {}
 recent_flows = deque()
 
@@ -51,9 +49,7 @@ SERVICE_MAP = {
     8080: "http-alt",
 }
 
-# -----------------------------
 # Basic helpers
-# -----------------------------
 def get_proto(packet):
     if TCP in packet:
         return "tcp"
@@ -102,9 +98,7 @@ def tcp_flags_str(packet):
         return ""
     return str(packet[TCP].flags)
 
-# -----------------------------
 # Completeness check
-# -----------------------------
 def is_flow_scoreable(flow):
     """
     Reject flows that are too incomplete to score meaningfully.
@@ -119,9 +113,7 @@ def is_flow_scoreable(flow):
         return False, f"source payload too small ({flow['sbytes']} bytes)"
     return True, "ok"
 
-# -----------------------------
 # State inference
-# -----------------------------
 def infer_state(flow):
     proto = flow["proto"]
 
@@ -194,9 +186,7 @@ def count_recent_state_ttl(state, sttl, now):
         if f["state"] == state and f["sttl"] == sttl
     )
 
-# -----------------------------
 # Feature computation
-# -----------------------------
 def compute_features(flow):
     dur = flow["last_seen"] - flow["start_time"]
     total_bytes = flow["sbytes"] + flow["dbytes"]
@@ -270,9 +260,7 @@ def compute_features(flow):
         "sjit": sjit,
     }
 
-# -----------------------------
 # Finalization
-# -----------------------------
 def add_flow_to_recent_history(flow, features):
     recent_flows.append({
         "src_ip":   flow["origin_src_ip"],
@@ -426,9 +414,7 @@ def handle_packet(packet):
         if flow["saw_rst"] or flow["saw_fin"]:
             finalize_flow(flow_key)
 
-# -----------------------------
 # Main
-# -----------------------------
 if __name__ == "__main__":
     print("Starting IDS packet capture...")
     print(f"  Warm-up:    {MIN_HISTORY} flows before predictions begin")
